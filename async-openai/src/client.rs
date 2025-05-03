@@ -337,11 +337,28 @@ impl<C: Config> Client<C> {
                 .map_err(backoff::Error::Permanent)?;
 
             if status.is_server_error() {
+                if status.as_u16() == 500 {
+                    // 500 is a special case where OpenAI returns a HTML page instead of JSON
+                    // and we cannot deserialize it.
+                    let message = String::from_utf8_lossy(&bytes).into_owned();
+                    tracing::warn!("Server error: {status} - {message}");
+                    return Err(backoff::Error::Permanent(OpenAIError::ApiError(ApiError {
+                        message,
+                        r#type: None,
+                        param: None,
+                        code: None,
+                    })));
+                }
                 // OpenAI does not guarantee server errors are returned as JSON so we cannot deserialize them.
                 let message: String = String::from_utf8_lossy(&bytes).into_owned();
                 tracing::warn!("Server error: {status} - {message}");
                 return Err(backoff::Error::Transient {
-                    err: OpenAIError::ApiError(ApiError { message, r#type: None, param: None, code: None }),
+                    err: OpenAIError::ApiError(ApiError {
+                        message,
+                        r#type: None,
+                        param: None,
+                        code: None,
+                    }),
                     retry_after: None,
                 });
             }
