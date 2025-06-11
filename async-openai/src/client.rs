@@ -496,9 +496,19 @@ where
                             break;
                         }
 
-                        let response = match serde_json::from_str::<O>(&message.data) {
-                            Err(e) => Err(map_deserialization_error(e, message.data.as_bytes())),
-                            Ok(output) => Ok(output),
+                        // Check if this is an error response before attempting deserialization
+                        let response = if message.data.contains("\"error\":{") {
+                            // This is an error response, parse it as WrappedError
+                            match serde_json::from_str::<crate::error::WrappedError>(&message.data) {
+                                Ok(wrapped_error) => Err(OpenAIError::StreamError(wrapped_error.error.message)),
+                                Err(_) => Err(OpenAIError::StreamError(format!("Failed to parse error response: {:?}", &message)))
+                            }
+                        } else {
+                            // Normal response, deserialize as expected type
+                            match serde_json::from_str::<O>(&message.data) {
+                                Err(e) => Err(map_deserialization_error(e, message.data.as_bytes())),
+                                Ok(output) => Ok(output),
+                            }
                         };
 
                         if let Err(_e) = tx.send(response) {
