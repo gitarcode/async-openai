@@ -1,5 +1,5 @@
 //! Errors originating from API calls, parsing responses, and reading-or-writing to the file system.
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenAIError {
@@ -28,7 +28,7 @@ pub enum OpenAIError {
 }
 
 /// OpenAI API returns error object on failure
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ApiError {
     pub message: String,
     pub r#type: Option<String>,
