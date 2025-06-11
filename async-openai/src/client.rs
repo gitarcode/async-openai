@@ -5,6 +5,7 @@ use futures::{stream::StreamExt, Stream};
 use reqwest::multipart::Form;
 use reqwest_eventsource::{Event, EventSource, RequestBuilderExt};
 use serde::{de::DeserializeOwned, Serialize};
+use tracing::info;
 
 use crate::{
     config::{Config, OpenAIConfig},
@@ -341,7 +342,12 @@ impl<C: Config> Client<C> {
                 let message: String = String::from_utf8_lossy(&bytes).into_owned();
                 tracing::warn!("Server error: {status} - {message}");
                 return Err(backoff::Error::Transient {
-                    err: OpenAIError::ApiError(ApiError { message, r#type: None, param: None, code: None }),
+                    err: OpenAIError::ApiError(ApiError {
+                        message,
+                        r#type: None,
+                        param: None,
+                        code: None,
+                    }),
                     retry_after: None,
                 });
             }
@@ -475,13 +481,14 @@ where
         while let Some(ev) = event_source.next().await {
             match ev {
                 Err(e) => {
+                    info!("(async) We got the error: {:?}", e);
                     if let Err(_e) = tx.send(Err(OpenAIError::StreamError(e.to_string()))) {
-                        // rx dropped
                         break;
                     }
                 }
                 Ok(event) => match event {
                     Event::Message(message) => {
+                        info!("(async) New message: {:?}", &message);
                         if message.data == "[DONE]" {
                             break;
                         }
@@ -492,7 +499,6 @@ where
                         };
 
                         if let Err(_e) = tx.send(response) {
-                            // rx dropped
                             break;
                         }
                     }
