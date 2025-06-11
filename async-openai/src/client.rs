@@ -410,16 +410,26 @@ impl<C: Config> Client<C> {
         I: Serialize,
         O: DeserializeOwned + std::marker::Send + 'static,
     {
-        let event_source = self
+        // Clone the request for potential retry as non-streaming
+        let request_clone = serde_json::to_value(&request).unwrap();
+        
+        let event_source_result = self
             .http_client
             .post(self.config.url(path))
             .query(&self.config.query())
             .headers(self.config.headers())
             .json(&request)
-            .eventsource()
-            .unwrap();
+            .eventsource();
 
-        stream(event_source).await
+        match event_source_result {
+            Ok(event_source) => stream_enhanced_error_handling(event_source).await,
+            Err(e) => {
+                // EventSource creation failed, return error immediately
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let _ = tx.send(Err(OpenAIError::StreamError(format!("Failed to create EventSource: {}", e))));
+                Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
+            }
+        }
     }
 
     pub(crate) async fn post_stream_mapped_raw_events<I, O>(
@@ -465,6 +475,136 @@ impl<C: Config> Client<C> {
 
         stream(event_source).await
     }
+}
+
+/// Enhanced stream function with better error handling
+pub(crate) async fn stream_enhanced_error_handling<O>(
+    mut event_source: EventSource,
+) -> Pin<Box<dyn Stream<Item = Result<O, OpenAIError>> + Send>>
+where
+    O: DeserializeOwned + std::marker::Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        while let Some(ev) = event_source.next().await {
+            match ev {
+                Err(e) => {
+                    info!("(async) We got the error: {:?}", e);
+                    
+                    // Enhanced error handling with better messages
+                    let pretty_err = match e {
+                        reqwest_eventsource::Error::InvalidStatusCode(status_code, response) => {
+                            let status_str = status_code.to_string();
+                            match response.text().await {
+                                Ok(response_text) => {
+                                    if response_text.trim().is_empty() {
+                                        format!("Invalid status code: {}", status_str)
+                                    } else {
+                                        // Try to parse as JSON error response first
+                                        if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&response_text) {
+                                            if let Some(error_obj) = json_val.get("error") {
+                                                if let Some(message) = error_obj.get("message").and_then(|m| m.as_str()) {
+                                                    format!("Bad request: {}", message)
+                                                } else {
+                                                    format!("Error response: {}", response_text)
+                                                }
+                                            } else {
+                                                format!("Error response: {}", response_text)
+                                            }
+                                        } else {
+                                            // Not JSON, return raw response
+                                            format!("Error: {}", response_text)
+                                        }
+                                    }
+                                }
+                                Err(_) => format!("Invalid status code: {}", status_str)
+                            }
+                        }
+                        reqwest_eventsource::Error::InvalidContentType(header_value, response) => {
+                            let header_str = header_value.to_str().unwrap_or("unknown");
+                            match response.text().await {
+                                Ok(response_text) => {
+                                    if response_text.trim().is_empty() {
+                                        format!("Invalid content type: {}", header_str)
+                                    } else {
+                                        format!("Invalid content type: {}\nResponse: {}", header_str, response_text)
+                                    }
+                                }
+                                Err(_) => format!("Invalid content type: {}", header_str)
+                            }
+                        }
+                        reqwest_eventsource::Error::Transport(ref transport_err) => {
+                            // Handle transport errors which might contain HTTP error responses
+                            if let Some(status) = transport_err.status() {
+                                if status.is_client_error() || status.is_server_error() {
+                                    format!("HTTP Error {}: {}", status.as_u16(), transport_err)
+                                } else {
+                                    format!("Transport error: {}", transport_err)
+                                }
+                            } else {
+                                // Check if this is a decode error that might indicate a non-SSE response
+                                let err_msg = transport_err.to_string();
+                                if err_msg.contains("unexpected EOF") || err_msg.contains("chunk size") || err_msg.contains("decoding response body") {
+                                    format!("Server returned non-streaming response. This usually indicates an HTTP error response (like max_tokens exceeded) was sent instead of streaming data. Check your request parameters and try a non-streaming request to see the specific error.")
+                                } else {
+                                    format!("Transport error: {}", transport_err)
+                                }
+                            }
+                        }
+                        _ => e.to_string(),
+                    };
+
+                    if let Err(_e) = tx.send(Err(OpenAIError::StreamError(pretty_err))) {
+                        // rx dropped
+                        break;
+                    }
+                }
+                Ok(event) => match event {
+                    Event::Message(message) => {
+                        info!("(async) New message: {:?}", &message);
+                        if message.data == "[DONE]" {
+                            break;
+                        }
+
+                        // Check if this is an error response before attempting deserialization
+                        let response = if message.data.contains("\"error\":{") {
+                            // This is an error response, parse it and convert to OpenAIError
+                            match serde_json::from_str::<serde_json::Value>(&message.data) {
+                                Ok(json_val) => {
+                                    if let Some(error_obj) = json_val.get("error") {
+                                        let error_message = error_obj.get("message")
+                                            .and_then(|m| m.as_str())
+                                            .unwrap_or("Unknown error");
+                                        Err(OpenAIError::StreamError(error_message.to_string()))
+                                    } else {
+                                        Err(OpenAIError::StreamError("Unknown error format".to_string()))
+                                    }
+                                },
+                                Err(_) => Err(OpenAIError::StreamError("Failed to parse error response".to_string()))
+                            }
+                        } else {
+                            // Normal response, deserialize as expected type
+                            match serde_json::from_str::<O>(&message.data) {
+                                Err(e) => Err(map_deserialization_error(e, message.data.as_bytes())),
+                                Ok(output) => Ok(output),
+                            }
+                        };
+
+                        if let Err(_e) = tx.send(response) {
+                            // rx dropped
+                            break;
+                        }
+                    }
+                    Event::Open => continue,
+                },
+            }
+        }
+
+        event_source.close();
+    });
+
+    Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
 }
 
 /// Request which responds with SSE.
