@@ -507,8 +507,6 @@ where
     let tx_clone = tx.clone();
 
     let task_handle = tokio::spawn(async move {
-        let mut cleanup_guard = EventSourceCleanupGuard::new(&mut event_source);
-        
         while let Some(ev) = event_source.next().await {
             match ev {
                 Err(e) => {
@@ -548,8 +546,10 @@ where
             }
         }
 
-        // Explicit cleanup happens in Drop for cleanup_guard
-        cleanup_guard.cleanup().await;
+        // Explicit cleanup
+        event_source.close();
+        // Small delay to ensure connection is fully closed
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     });
 
     // Create a stream that cleans up the task when dropped
@@ -604,34 +604,6 @@ where
     Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
 }
 
-/// Guard to ensure EventSource cleanup
-struct EventSourceCleanupGuard<'a> {
-    event_source: &'a mut EventSource,
-    cleaned: bool,
-}
-
-impl<'a> EventSourceCleanupGuard<'a> {
-    fn new(event_source: &'a mut EventSource) -> Self {
-        Self { event_source, cleaned: false }
-    }
-    
-    async fn cleanup(&mut self) {
-        if !self.cleaned {
-            self.event_source.close();
-            // Small delay to ensure connection is fully closed
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            self.cleaned = true;
-        }
-    }
-}
-
-impl<'a> Drop for EventSourceCleanupGuard<'a> {
-    fn drop(&mut self) {
-        if !self.cleaned {
-            self.event_source.close();
-        }
-    }
-}
 
 /// Stream wrapper that ensures cleanup when dropped
 struct StreamWithCleanup<T> {
