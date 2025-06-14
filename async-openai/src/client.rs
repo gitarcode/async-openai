@@ -480,8 +480,9 @@ where
     O: DeserializeOwned + std::marker::Send + 'static,
 {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let tx_clone = tx.clone();
 
-    tokio::spawn(async move {
+    let task_handle = tokio::spawn(async move {
         while let Some(ev) = event_source.next().await {
             match ev {
                 Err(e) => {
@@ -521,10 +522,14 @@ where
             }
         }
 
+        // Explicit cleanup
         event_source.close();
+        // Small delay to ensure connection is fully closed
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     });
 
-    Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
+    // Create a stream that cleans up the task when dropped
+    Box::pin(StreamWithCleanup::new(rx, task_handle, tx_clone))
 }
 
 pub(crate) async fn stream_mapped_raw_events<O>(
@@ -573,4 +578,44 @@ where
     });
 
     Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
+}
+
+
+/// Stream wrapper that ensures cleanup when dropped
+struct StreamWithCleanup<T> {
+    stream: tokio_stream::wrappers::UnboundedReceiverStream<T>,
+    task_handle: tokio::task::JoinHandle<()>,
+    _tx: tokio::sync::mpsc::UnboundedSender<T>,
+}
+
+impl<T> StreamWithCleanup<T> {
+    fn new(
+        rx: tokio::sync::mpsc::UnboundedReceiver<T>,
+        task_handle: tokio::task::JoinHandle<()>,
+        tx: tokio::sync::mpsc::UnboundedSender<T>,
+    ) -> Self {
+        Self {
+            stream: tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+            task_handle,
+            _tx: tx,
+        }
+    }
+}
+
+impl<T> Stream for StreamWithCleanup<T> {
+    type Item = T;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        Pin::new(&mut self.stream).poll_next(cx)
+    }
+}
+
+impl<T> Drop for StreamWithCleanup<T> {
+    fn drop(&mut self) {
+        // Abort the background task to ensure cleanup
+        self.task_handle.abort();
+    }
 }
